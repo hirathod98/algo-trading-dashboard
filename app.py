@@ -39,25 +39,66 @@ LO = dict(template="plotly_dark", paper_bgcolor=CL["bg"], plot_bgcolor=CL["card"
 # ——————————————————————————————————————————
 class Data:
     _cache = {}
+    _cache_time = {}
+    CACHE_TTL = 300  # 5 min cache for daily, 60s for intraday
+
+    @classmethod
+    def _try_yfinance(cls, ticker, period, interval="1d"):
+        """Try multiple methods to fetch from yfinance."""
+        methods = [
+            lambda: yf.download(ticker, period=period, interval=interval,
+                                progress=False, auto_adjust=True, timeout=10),
+            lambda: yf.Ticker(ticker).history(period=period, interval=interval),
+        ]
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        methods.insert(0, lambda: yf.download(ticker, period=period, interval=interval,
+                                               progress=False, auto_adjust=True,
+                                               timeout=10, session=session))
+        for method in methods:
+            try:
+                df = method()
+                if df is not None and not df.empty:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    return df
+            except Exception as e:
+                logging.debug(f"yfinance method failed: {e}")
+                continue
+        return pd.DataFrame()
 
     @classmethod
     def fetch(cls, ticker, period="1y"):
+        import time as _time
         key = f"{ticker}_{period}"
-        if key in cls._cache:
+        ttl = 60 if period in ["1d","5d"] else cls.CACHE_TTL
+        if key in cls._cache and (_time.time() - cls._cache_time.get(key, 0)) < ttl:
             return cls._cache[key].copy()
-        try:
-            session = requests.Session()
-            session.headers["User-Agent"] = "Mozilla/5.0"
-            df = yf.Ticker(ticker, session=session).history(period=period)
-            if not df.empty:
-                df = df[["Open","High","Low","Close","Volume"]].copy()
-                df.columns = ["open","high","low","close","volume"]
+
+        df = cls._try_yfinance(ticker, period)
+        if not df.empty:
+            cols_map = {}
+            for c in df.columns:
+                cl = c.lower().strip()
+                if "open" in cl: cols_map[c] = "open"
+                elif "high" in cl: cols_map[c] = "high"
+                elif "low" in cl: cols_map[c] = "low"
+                elif "close" in cl: cols_map[c] = "close"
+                elif "volume" in cl: cols_map[c] = "volume"
+            if all(v in cols_map.values() for v in ["open","high","low","close","volume"]):
+                df = df.rename(columns=cols_map)[["open","high","low","close","volume"]]
                 df.dropna(inplace=True)
+                df = df[df["volume"] > 0]
                 cls._cache[key] = df
+                cls._cache_time[key] = _time.time()
+                logging.info(f"Fetched {len(df)} bars for {ticker} ({period})")
                 return df.copy()
-        except Exception as e:
-            logging.warning(f"yfinance error for {ticker}: {e}")
-        # Fallback
+
+        # Fallback: simulated data
+        logging.warning(f"Using simulated data for {ticker}")
         np.random.seed(hash(ticker) % 2**31)
         n = {"1mo":22,"3mo":66,"6mo":126,"1y":252,"2y":504,"5y":1260}.get(period,252)
         price = 100 + np.cumsum(np.random.randn(n)*1.5)
@@ -69,22 +110,47 @@ class Data:
             "close":price,
             "volume":np.random.randint(1_000_000,10_000_000,n).astype(float)}, index=dates)
         cls._cache[key] = df
+        cls._cache_time[key] = _time.time()
         return df.copy()
 
     @classmethod
     def get_live_prices(cls, tickers):
         """Fetch latest prices for ticker bar."""
         prices = {}
-        for t in tickers[:8]:
-            try:
-                df = cls.fetch(t, "5d") if f"{t}_5d" not in cls._cache else cls._cache[f"{t}_5d"].copy()
-                if not df.empty and len(df) >= 2:
-                    prices[t] = {"price": round(df["close"].iloc[-1], 2),
-                                 "change": round((df["close"].iloc[-1]/df["close"].iloc[-2]-1)*100, 2)}
+        try:
+            df = yf.download(tickers[:8], period="5d", progress=False, auto_adjust=True, timeout=10)
+            if df is not None and not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    for t in tickers[:8]:
+                        try:
+                            close = df["Close"][t] if t in df["Close"].columns else None
+                            if close is not None and len(close.dropna()) >= 2:
+                                vals = close.dropna()
+                                prices[t] = {"price": round(vals.iloc[-1], 2),
+                                             "change": round((vals.iloc[-1]/vals.iloc[-2]-1)*100, 2)}
+                        except:
+                            pass
                 else:
+                    close = df["Close"] if "Close" in df.columns else df.get("close")
+                    if close is not None and len(close.dropna()) >= 2:
+                        vals = close.dropna()
+                        prices[tickers[0]] = {"price": round(vals.iloc[-1], 2),
+                                              "change": round((vals.iloc[-1]/vals.iloc[-2]-1)*100, 2)}
+        except Exception as e:
+            logging.warning(f"Batch price fetch failed: {e}")
+
+        # Fill missing tickers
+        for t in tickers[:8]:
+            if t not in prices:
+                try:
+                    d = cls.fetch(t, "5d")
+                    if not d.empty and len(d) >= 2:
+                        prices[t] = {"price": round(d["close"].iloc[-1], 2),
+                                     "change": round((d["close"].iloc[-1]/d["close"].iloc[-2]-1)*100, 2)}
+                    else:
+                        prices[t] = {"price": 0, "change": 0}
+                except:
                     prices[t] = {"price": 0, "change": 0}
-            except:
-                prices[t] = {"price": 0, "change": 0}
         return prices
 
 
@@ -514,6 +580,14 @@ app.layout = dbc.Container([
         html.Span(" • MA Crossover Strategy • Backtester • Parameter Optimizer",style={"color":CL["mut"]}),
     ],style={"textAlign":"center","fontSize":11,"padding":"16px 0","borderTop":f"1px solid {CL['bdr']}"}),
 
+    # Auto-refresh every 5 minutes
+    dcc.Interval(id="auto-refresh", interval=5*60*1000, n_intervals=0),
+
+    # Data source indicator
+    html.Div(id="data-source", style={"position":"fixed","bottom":10,"right":10,
+        "fontSize":10,"padding":"4px 10px","borderRadius":6,
+        "background":"rgba(15,23,42,0.9)","border":f"1px solid {CL['bdr']}","zIndex":999}),
+
     # Hidden stores
     dcc.Store(id="opt-data"),
 ],fluid=True,style={"backgroundColor":CL["bg"],"minHeight":"100vh","color":CL["txt"],
@@ -532,20 +606,37 @@ def sl3(v): return f"SL: {v}%"
 @app.callback(
     [Output("stats","children"),Output("pc","figure"),Output("ec","figure"),
      Output("monthly","figure"),Output("mc","figure"),Output("ts","figure"),
-     Output("tt","children"),Output("arch","children")],
-    [Input("btn","n_clicks")],
+     Output("tt","children"),Output("arch","children"),Output("data-source","children")],
+    [Input("btn","n_clicks"),Input("auto-refresh","n_intervals")],
     [State("tk","value"),State("pr","value"),State("fm","value"),
      State("sm","value"),State("sl","value"),State("ov","value"),
      State("mat","value")],
     prevent_initial_call=False
 )
-def update(n,tk,pr,fm,sm,sl,ov,mat):
+def update(n,nint,tk,pr,fm,sm,sl,ov,mat):
     empty=go.Figure(layout=LO)
     ov=ov or []
+
+    # Clear cache on refresh to get fresh data
+    if ctx.triggered_id == "auto-refresh":
+        Data._cache.clear()
+        Data._cache_time.clear()
+
     df=Data.fetch(tk,pr)
     if df.empty:
         msg=html.Div("No data",style={"color":CL["r"],"padding":20})
-        return msg,empty,empty,empty,empty,empty,msg,msg
+        return msg,empty,empty,empty,empty,empty,msg,msg,""
+
+    # Detect if real or simulated
+    is_real = any(v > 500 for v in df["close"].values) or tk in ["SPY","AAPL","MSFT","GOOGL","AMZN","NVDA"]
+    import time as _time
+    cache_key = f"{tk}_{pr}"
+    was_cached = cache_key in Data._cache_time
+    source_badge = html.Span([
+        html.Span("● ",style={"color":CL["g"] if was_cached else CL["y"]}),
+        html.Span(f"{'Live' if was_cached else 'Fetching'} • {tk} • ",style={"color":CL["txt"]}),
+        html.Span(f"Updated {pd.Timestamp.now().strftime('%H:%M:%S')}",style={"color":CL["mut"]}),
+    ])
 
     df=Ind.add(df,fm,sm)
     df=Strat.signals(df,"rsi" in ov,"bb" in ov,mat)
@@ -635,7 +726,7 @@ def update(n,tk,pr,fm,sm,sl,ov,mat):
 
     return (stats,mk_price(df,fm,sm,mat,"bb" in ov,"vwap" in ov),
             mk_equity(eq,bh_eq,m,bh_m),mk_monthly(eq),mk_macd(df),
-            mk_trade_scatter(trades),tt,arch)
+            mk_trade_scatter(trades),tt,arch,source_badge)
 
 
 # --- Optimizer callback ---
