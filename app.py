@@ -40,118 +40,167 @@ LO = dict(template="plotly_dark", paper_bgcolor=CL["bg"], plot_bgcolor=CL["card"
 class Data:
     _cache = {}
     _cache_time = {}
-    CACHE_TTL = 300  # 5 min cache for daily, 60s for intraday
+    CACHE_TTL = 300
+    AV_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+    AV_BASE = "https://www.alphavantage.co/query"
+    _source = {}  # Track data source per ticker
 
     @classmethod
-    def _try_yfinance(cls, ticker, period, interval="1d"):
-        """Try multiple methods to fetch from yfinance."""
-        methods = [
-            lambda: yf.download(ticker, period=period, interval=interval,
-                                progress=False, auto_adjust=True, timeout=10),
-            lambda: yf.Ticker(ticker).history(period=period, interval=interval),
-        ]
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        })
-        methods.insert(0, lambda: yf.download(ticker, period=period, interval=interval,
-                                               progress=False, auto_adjust=True,
-                                               timeout=10, session=session))
-        for method in methods:
-            try:
-                df = method()
-                if df is not None and not df.empty:
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(0)
-                    return df
-            except Exception as e:
-                logging.debug(f"yfinance method failed: {e}")
-                continue
+    def _fetch_alpha_vantage(cls, ticker, period="1y"):
+        """Fetch from Alpha Vantage API (primary source)."""
+        if not cls.AV_KEY:
+            return pd.DataFrame()
+        try:
+            # Use daily data
+            params = {
+                "function": "TIME_SERIES_DAILY",
+                "symbol": ticker,
+                "outputsize": "full" if period in ["2y","5y"] else "compact",
+                "apikey": cls.AV_KEY
+            }
+            resp = requests.get(cls.AV_BASE, params=params, timeout=15)
+            data = resp.json()
+
+            if "Time Series (Daily)" not in data:
+                logging.warning(f"Alpha Vantage: {data.get('Note', data.get('Information', 'No data'))}")
+                return pd.DataFrame()
+
+            ts = data["Time Series (Daily)"]
+            rows = []
+            for date_str, vals in ts.items():
+                rows.append({
+                    "date": pd.Timestamp(date_str),
+                    "open": float(vals["1. open"]),
+                    "high": float(vals["2. high"]),
+                    "low": float(vals["3. low"]),
+                    "close": float(vals["4. close"]),
+                    "volume": float(vals["5. volume"]),
+                })
+            df = pd.DataFrame(rows).set_index("date").sort_index()
+
+            # Filter to requested period
+            n_days = {"1mo":30,"3mo":90,"6mo":180,"1y":365,"2y":730,"5y":1825}.get(period, 365)
+            cutoff = pd.Timestamp.today() - pd.Timedelta(days=n_days)
+            df = df[df.index >= cutoff]
+            df = df[df["volume"] > 0]
+
+            if not df.empty:
+                logging.info(f"Alpha Vantage: {len(df)} bars for {ticker}")
+                cls._source[ticker] = "Alpha Vantage"
+            return df
+
+        except Exception as e:
+            logging.warning(f"Alpha Vantage error for {ticker}: {e}")
+            return pd.DataFrame()
+
+    @classmethod
+    def _fetch_alpha_vantage_quote(cls, ticker):
+        """Fetch real-time quote from Alpha Vantage."""
+        if not cls.AV_KEY:
+            return None
+        try:
+            params = {
+                "function": "GLOBAL_QUOTE",
+                "symbol": ticker,
+                "apikey": cls.AV_KEY
+            }
+            resp = requests.get(cls.AV_BASE, params=params, timeout=10)
+            data = resp.json()
+            q = data.get("Global Quote", {})
+            if q:
+                return {
+                    "price": float(q.get("05. price", 0)),
+                    "change": float(q.get("10. change percent", "0").replace("%", "")),
+                    "volume": int(float(q.get("06. volume", 0))),
+                    "prev_close": float(q.get("08. previous close", 0)),
+                }
+        except Exception as e:
+            logging.warning(f"AV quote error {ticker}: {e}")
+        return None
+
+    @classmethod
+    def _fetch_yfinance(cls, ticker, period="1y"):
+        """Backup: yfinance."""
+        try:
+            session = requests.Session()
+            session.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            df = yf.Ticker(ticker, session=session).history(period=period)
+            if not df.empty:
+                df = df[["Open","High","Low","Close","Volume"]].copy()
+                df.columns = ["open","high","low","close","volume"]
+                df.dropna(inplace=True)
+                df = df[df["volume"] > 0]
+                if not df.empty:
+                    cls._source[ticker] = "Yahoo Finance"
+                return df
+        except Exception as e:
+            logging.warning(f"yfinance error {ticker}: {e}")
         return pd.DataFrame()
 
     @classmethod
+    def _generate_fallback(cls, ticker, period):
+        """Last resort: simulated data."""
+        cls._source[ticker] = "Simulated"
+        np.random.seed(hash(ticker) % 2**31)
+        n = {"1mo":22,"3mo":66,"6mo":126,"1y":252,"2y":504,"5y":1260}.get(period, 252)
+        price = 100 + np.cumsum(np.random.randn(n)*1.5)
+        price = np.maximum(price, 10)
+        dates = pd.bdate_range(end=pd.Timestamp.today(), periods=n)
+        return pd.DataFrame({"open":price+np.random.randn(n)*0.3,
+            "high":price+abs(np.random.randn(n))*1.0,
+            "low":price-abs(np.random.randn(n))*1.0,
+            "close":price,
+            "volume":np.random.randint(1_000_000,10_000_000,n).astype(float)}, index=dates)
+
+    @classmethod
     def fetch(cls, ticker, period="1y"):
+        """Fetch data: Alpha Vantage → yfinance → simulated fallback."""
         import time as _time
         key = f"{ticker}_{period}"
         ttl = 60 if period in ["1d","5d"] else cls.CACHE_TTL
         if key in cls._cache and (_time.time() - cls._cache_time.get(key, 0)) < ttl:
             return cls._cache[key].copy()
 
-        df = cls._try_yfinance(ticker, period)
-        if not df.empty:
-            cols_map = {}
-            for c in df.columns:
-                cl = c.lower().strip()
-                if "open" in cl: cols_map[c] = "open"
-                elif "high" in cl: cols_map[c] = "high"
-                elif "low" in cl: cols_map[c] = "low"
-                elif "close" in cl: cols_map[c] = "close"
-                elif "volume" in cl: cols_map[c] = "volume"
-            if all(v in cols_map.values() for v in ["open","high","low","close","volume"]):
-                df = df.rename(columns=cols_map)[["open","high","low","close","volume"]]
-                df.dropna(inplace=True)
-                df = df[df["volume"] > 0]
-                cls._cache[key] = df
-                cls._cache_time[key] = _time.time()
-                logging.info(f"Fetched {len(df)} bars for {ticker} ({period})")
-                return df.copy()
+        # Try Alpha Vantage first
+        df = cls._fetch_alpha_vantage(ticker, period)
 
-        # Fallback: simulated data
-        logging.warning(f"Using simulated data for {ticker}")
-        np.random.seed(hash(ticker) % 2**31)
-        n = {"1mo":22,"3mo":66,"6mo":126,"1y":252,"2y":504,"5y":1260}.get(period,252)
-        price = 100 + np.cumsum(np.random.randn(n)*1.5)
-        price = np.maximum(price, 10)
-        dates = pd.bdate_range(end=pd.Timestamp.today(), periods=n)
-        df = pd.DataFrame({"open":price+np.random.randn(n)*0.3,
-            "high":price+abs(np.random.randn(n))*1.0,
-            "low":price-abs(np.random.randn(n))*1.0,
-            "close":price,
-            "volume":np.random.randint(1_000_000,10_000_000,n).astype(float)}, index=dates)
+        # Backup: yfinance
+        if df.empty:
+            df = cls._fetch_yfinance(ticker, period)
+
+        # Last resort: simulated
+        if df.empty:
+            df = cls._generate_fallback(ticker, period)
+
         cls._cache[key] = df
         cls._cache_time[key] = _time.time()
         return df.copy()
 
     @classmethod
     def get_live_prices(cls, tickers):
-        """Fetch latest prices for ticker bar."""
+        """Fetch latest prices — uses AV quotes for real-time."""
         prices = {}
-        try:
-            df = yf.download(tickers[:8], period="5d", progress=False, auto_adjust=True, timeout=10)
-            if df is not None and not df.empty:
-                if isinstance(df.columns, pd.MultiIndex):
-                    for t in tickers[:8]:
-                        try:
-                            close = df["Close"][t] if t in df["Close"].columns else None
-                            if close is not None and len(close.dropna()) >= 2:
-                                vals = close.dropna()
-                                prices[t] = {"price": round(vals.iloc[-1], 2),
-                                             "change": round((vals.iloc[-1]/vals.iloc[-2]-1)*100, 2)}
-                        except:
-                            pass
-                else:
-                    close = df["Close"] if "Close" in df.columns else df.get("close")
-                    if close is not None and len(close.dropna()) >= 2:
-                        vals = close.dropna()
-                        prices[tickers[0]] = {"price": round(vals.iloc[-1], 2),
-                                              "change": round((vals.iloc[-1]/vals.iloc[-2]-1)*100, 2)}
-        except Exception as e:
-            logging.warning(f"Batch price fetch failed: {e}")
-
-        # Fill missing tickers
         for t in tickers[:8]:
-            if t not in prices:
-                try:
-                    d = cls.fetch(t, "5d")
-                    if not d.empty and len(d) >= 2:
-                        prices[t] = {"price": round(d["close"].iloc[-1], 2),
-                                     "change": round((d["close"].iloc[-1]/d["close"].iloc[-2]-1)*100, 2)}
-                    else:
-                        prices[t] = {"price": 0, "change": 0}
-                except:
+            # Try Alpha Vantage real-time quote
+            q = cls._fetch_alpha_vantage_quote(t)
+            if q and q["price"] > 0:
+                prices[t] = {"price": round(q["price"], 2), "change": round(q["change"], 2)}
+                continue
+            # Fallback to cached data
+            try:
+                d = cls.fetch(t, "1mo")
+                if not d.empty and len(d) >= 2:
+                    prices[t] = {"price": round(d["close"].iloc[-1], 2),
+                                 "change": round((d["close"].iloc[-1]/d["close"].iloc[-2]-1)*100, 2)}
+                else:
                     prices[t] = {"price": 0, "change": 0}
+            except:
+                prices[t] = {"price": 0, "change": 0}
         return prices
+
+    @classmethod
+    def get_source(cls, ticker):
+        return cls._source.get(ticker, "Unknown")
 
 
 # ——————————————————————————————————————————
@@ -627,15 +676,13 @@ def update(n,nint,tk,pr,fm,sm,sl,ov,mat):
         msg=html.Div("No data",style={"color":CL["r"],"padding":20})
         return msg,empty,empty,empty,empty,empty,msg,msg,""
 
-    # Detect if real or simulated
-    is_real = any(v > 500 for v in df["close"].values) or tk in ["SPY","AAPL","MSFT","GOOGL","AMZN","NVDA"]
-    import time as _time
-    cache_key = f"{tk}_{pr}"
-    was_cached = cache_key in Data._cache_time
+    # Detect source
+    source = Data.get_source(tk)
+    src_color = CL["g"] if source == "Alpha Vantage" else (CL["y"] if source == "Yahoo Finance" else CL["r"])
     source_badge = html.Span([
-        html.Span("● ",style={"color":CL["g"] if was_cached else CL["y"]}),
-        html.Span(f"{'Live' if was_cached else 'Fetching'} • {tk} • ",style={"color":CL["txt"]}),
-        html.Span(f"Updated {pd.Timestamp.now().strftime('%H:%M:%S')}",style={"color":CL["mut"]}),
+        html.Span("● ", style={"color": src_color}),
+        html.Span(f"{source} • {tk} • {len(df)} bars • ", style={"color": CL["txt"]}),
+        html.Span(f"Updated {pd.Timestamp.now().strftime('%H:%M:%S')}", style={"color": CL["mut"]}),
     ])
 
     df=Ind.add(df,fm,sm)
