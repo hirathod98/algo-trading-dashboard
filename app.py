@@ -1,4 +1,28 @@
-import dash
+# Indian NSE + US tickers
+# Display name → (Alpha Vantage symbol, yfinance symbol)
+TICKER_MAP = {
+    "RELIANCE": ("NSE:RELIANCE", "RELIANCE.NS"),
+    "TCS":      ("NSE:TCS", "TCS.NS"),
+    "INFY":     ("NSE:INFY", "INFY.NS"),
+    "HDFCBANK": ("NSE:HDFCBANK", "HDFCBANK.NS"),
+    "ICICIBANK":("NSE:ICICIBANK", "ICICIBANK.NS"),
+    "SBIN":     ("NSE:SBIN", "SBIN.NS"),
+    "ITC":      ("NSE:ITC", "ITC.NS"),
+    "BHARTIARTL":("NSE:BHARTIARTL", "BHARTIARTL.NS"),
+    "WIPRO":    ("NSE:WIPRO", "WIPRO.NS"),
+    "LT":       ("NSE:LT", "LT.NS"),
+    "TATAMOTORS":("NSE:TATAMOTORS", "TATAMOTORS.NS"),
+    "HCLTECH":  ("NSE:HCLTECH", "HCLTECH.NS"),
+    "MARUTI":   ("NSE:MARUTI", "MARUTI.NS"),
+    "ADANIENT": ("NSE:ADANIENT", "ADANIENT.NS"),
+    "TATASTEEL":("NSE:TATASTEEL", "TATASTEEL.NS"),
+    "NIFTY50":  ("NSE:NIFTY50", "^NSEI"),
+    "BANKNIFTY":("NSE:BANKNIFTY", "^NSEBANK"),
+    "SPY":      ("SPY", "SPY"),
+    "AAPL":     ("AAPL", "AAPL"),
+    "NVDA":     ("NVDA", "NVDA"),
+}
+TICKERS = list(TICKER_MAP.keys())import dash
 from dash import html, dcc, Input, Output, State, dash_table, ctx, ALL
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
@@ -16,7 +40,32 @@ logging.basicConfig(level=logging.WARNING)
 # ——————————————————————————————————————————
 # CONFIG
 # ——————————————————————————————————————————
-TICKERS = ["SPY","AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","QQQ","AMD","JPM","NFLX","BA","DIS","V"]
+
+# Indian NSE + US tickers
+# Display name → (Alpha Vantage symbol, yfinance symbol)
+TICKER_MAP = {
+    "RELIANCE": ("NSE:RELIANCE", "RELIANCE.NS"),
+    "TCS":      ("NSE:TCS", "TCS.NS"),
+    "INFY":     ("NSE:INFY", "INFY.NS"),
+    "HDFCBANK": ("NSE:HDFCBANK", "HDFCBANK.NS"),
+    "ICICIBANK":("NSE:ICICIBANK", "ICICIBANK.NS"),
+    "SBIN":     ("NSE:SBIN", "SBIN.NS"),
+    "ITC":      ("NSE:ITC", "ITC.NS"),
+    "BHARTIARTL":("NSE:BHARTIARTL", "BHARTIARTL.NS"),
+    "WIPRO":    ("NSE:WIPRO", "WIPRO.NS"),
+    "LT":       ("NSE:LT", "LT.NS"),
+    "TATAMOTORS":("NSE:TATAMOTORS", "TATAMOTORS.NS"),
+    "HCLTECH":  ("NSE:HCLTECH", "HCLTECH.NS"),
+    "MARUTI":   ("NSE:MARUTI", "MARUTI.NS"),
+    "ADANIENT": ("NSE:ADANIENT", "ADANIENT.NS"),
+    "TATASTEEL":("NSE:TATASTEEL", "TATASTEEL.NS"),
+    "NIFTY50":  ("NSE:NIFTY50", "^NSEI"),
+    "BANKNIFTY":("NSE:BANKNIFTY", "^NSEBANK"),
+    "SPY":      ("SPY", "SPY"),
+    "AAPL":     ("AAPL", "AAPL"),
+    "NVDA":     ("NVDA", "NVDA"),
+}
+TICKERS = list(TICKER_MAP.keys())
 
 CL = {"bg":"#0b1121","card":"#0f172a","card2":"#131b2e","bdr":"rgba(255,255,255,0.06)",
       "txt":"#e2e8f0","mut":"#64748b","grid":"rgba(255,255,255,0.04)",
@@ -46,15 +95,22 @@ class Data:
     _source = {}  # Track data source per ticker
 
     @classmethod
+    def _get_symbols(cls, ticker):
+        """Get Alpha Vantage and yfinance symbols for a display ticker."""
+        if ticker in TICKER_MAP:
+            return TICKER_MAP[ticker]
+        return (ticker, ticker)
+
+    @classmethod
     def _fetch_alpha_vantage(cls, ticker, period="1y"):
         """Fetch from Alpha Vantage API (primary source)."""
         if not cls.AV_KEY:
             return pd.DataFrame()
+        av_sym, _ = cls._get_symbols(ticker)
         try:
-            # Use daily data
             params = {
                 "function": "TIME_SERIES_DAILY",
-                "symbol": ticker,
+                "symbol": av_sym,
                 "outputsize": "full" if period in ["2y","5y"] else "compact",
                 "apikey": cls.AV_KEY
             }
@@ -98,10 +154,11 @@ class Data:
         """Fetch real-time quote from Alpha Vantage."""
         if not cls.AV_KEY:
             return None
+        av_sym, _ = cls._get_symbols(ticker)
         try:
             params = {
                 "function": "GLOBAL_QUOTE",
-                "symbol": ticker,
+                "symbol": av_sym,
                 "apikey": cls.AV_KEY
             }
             resp = requests.get(cls.AV_BASE, params=params, timeout=10)
@@ -121,10 +178,11 @@ class Data:
     @classmethod
     def _fetch_yfinance(cls, ticker, period="1y"):
         """Backup: yfinance."""
+        _, yf_sym = cls._get_symbols(ticker)
         try:
             session = requests.Session()
             session.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-            df = yf.Ticker(ticker, session=session).history(period=period)
+            df = yf.Ticker(yf_sym, session=session).history(period=period)
             if not df.empty:
                 df = df[["Open","High","Low","Close","Volume"]].copy()
                 df.columns = ["open","high","low","close","volume"]
@@ -572,8 +630,8 @@ app.layout = dbc.Container([
     dbc.Card(dbc.CardBody([
         dbc.Row([
             dbc.Col([html.Label("Ticker",style={"fontSize":10,"color":CL["mut"],"fontWeight":600}),
-                dcc.Dropdown(id="tk",options=[{"label":t,"value":t} for t in TICKERS],
-                    value="SPY",clearable=False,style={"backgroundColor":"#1e293b"})],md=2),
+                dcc.Dropdown(id="tk",options=[{"label":f"{'🇮🇳 ' if t not in ['SPY','AAPL','NVDA'] else '🇺🇸 '}{t}","value":t} for t in TICKERS],
+                    value="RELIANCE",clearable=False,style={"backgroundColor":"#1e293b"})],md=2),
             dbc.Col([html.Label("Period",style={"fontSize":10,"color":CL["mut"],"fontWeight":600}),
                 dcc.Dropdown(id="pr",options=[{"label":l,"value":v} for l,v in
                     [("1M","1mo"),("3M","3mo"),("6M","6mo"),("1Y","1y"),("2Y","2y"),("5Y","5y")]],
@@ -665,6 +723,8 @@ def sl3(v): return f"SL: {v}%"
 def update(n,nint,tk,pr,fm,sm,sl,ov,mat):
     empty=go.Figure(layout=LO)
     ov=ov or []
+    is_indian = tk not in ["SPY","AAPL","NVDA"]
+    currency = "₹" if is_indian else "$"
 
     # Clear cache on refresh to get fresh data
     if ctx.triggered_id == "auto-refresh":
@@ -679,9 +739,10 @@ def update(n,nint,tk,pr,fm,sm,sl,ov,mat):
     # Detect source
     source = Data.get_source(tk)
     src_color = CL["g"] if source == "Alpha Vantage" else (CL["y"] if source == "Yahoo Finance" else CL["r"])
+    market = "NSE" if is_indian else "US"
     source_badge = html.Span([
         html.Span("● ", style={"color": src_color}),
-        html.Span(f"{source} • {tk} • {len(df)} bars • ", style={"color": CL["txt"]}),
+        html.Span(f"{source} • {market}:{tk} • {len(df)} bars • ", style={"color": CL["txt"]}),
         html.Span(f"Updated {pd.Timestamp.now().strftime('%H:%M:%S')}", style={"color": CL["mut"]}),
     ])
 
@@ -704,7 +765,7 @@ def update(n,nint,tk,pr,fm,sm,sl,ov,mat):
         scard("Max DD",f"{m['mdd']}%",CL["r"],f"Calmar: {m['calmar']}"),
         scard("Win Rate",f"{m['wr']}%",CL["y"],f"{m['nt']} trades"),
         scard("Profit Factor",str(m['pf']),CL["c"],
-              f"Exp: ${m['expectancy']}"),
+              f"Exp: {currency}{m['expectancy']}"),
     ])
 
     # Trade table
